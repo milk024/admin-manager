@@ -1,0 +1,23 @@
+{
+  "name": "admin_manager",
+  "version": "0.1.0",
+  "private": true,
+  "description": "관리자 인증, 네임스페이스 전체 YAML 관리, 개발자 계정(kubeconfig) 발급 전담 서버 — k8s_manager와 분리된 고권한 전용 서버",
+  "main": "main.cjs",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node main.cjs",
+    "dev": "node --watch main.cjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@kubernetes/client-node": "1.4.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "express": "5.2.1",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.1"
+  }
+}
