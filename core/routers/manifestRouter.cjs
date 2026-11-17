@@ -2,6 +2,7 @@
 
 const express = require('express');
 const k8sAdminService = require('../../services/k8sAdminService.cjs');
+const auditService = require('../../services/auditService.cjs');
 const manifestWhitelistHelper = require('../../helpers/manifestWhitelistHelper.cjs');
 const authMiddlewareHelper = require('../../helpers/authMiddlewareHelper.cjs');
 
@@ -67,7 +68,9 @@ router.put('/', async (req, res, next) => {
     if (!manifest?.apiVersion || !manifest?.kind) {
       return res.status(400).json({ error: 'apiVersion, kind는 필수입니다' });
     }
-    const result = await k8sAdminService.applyManifest(manifest, req.admin.sub);
+    const target = `${manifest.metadata?.namespace}/${manifest.kind}/${manifest.metadata?.name}`;
+    const result = await auditService.run(req, 'manifest.apply', target, null, () =>
+      k8sAdminService.applyManifest(manifest, req.admin.sub));
     res.json(result);
   } catch (err) {
     next(err);
@@ -80,7 +83,8 @@ router.delete('/', async (req, res, next) => {
     if (!apiVersion || !kind || !namespace || !name) {
       return res.status(400).json({ error: 'apiVersion, kind, namespace, name 쿼리 파라미터가 모두 필요합니다' });
     }
-    const result = await k8sAdminService.deleteManifest({ apiVersion, kind, namespace, name }, req.admin.sub);
+    const result = await auditService.run(req, 'manifest.delete', `${namespace}/${kind}/${name}`, null, () =>
+      k8sAdminService.deleteManifest({ apiVersion, kind, namespace, name }, req.admin.sub));
     res.json(result);
   } catch (err) {
     next(err);

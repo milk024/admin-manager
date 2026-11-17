@@ -1,5 +1,7 @@
 # admin-manager
 
+> 포트폴리오 공개용 스냅샷입니다. 실제 IP·도메인·조직명은 예시값(`10.0.0.x`, `example.ac.kr`, `myorg`)으로 바꿨고 비밀값은 포함하지 않습니다. 전체 소개는 [k8s-manager](https://github.com/milk024/k8s-manager) 를 보세요.
+
 > 쿠버네티스 클러스터의 **고권한 관리 작업만 전담하도록 분리한** 관리자 백엔드 서버
 > 관리자 인증 · 네임스페이스 YAML 관리 · 개발자 계정(kubeconfig) 발급/회수
 
@@ -50,7 +52,22 @@
 - 권한은 자유 입력이 아니라 **고정 RBAC 템플릿**(`readonly`, `namespace-write`) 중에서만 선택
   → K8s RBAC의 privilege-escalation 방지 규칙과 충돌하지 않고,
   admin-manager 자체 ClusterRole도 "템플릿들의 합집합"으로 최소한만 유지
-- 발급/회수 이력을 `account_issuances`에 기록
+- 발급/회수 이력을 `account_issuances`에 기록 (발급자 `issued_by`, 회수자 `revoked_by`)
+
+### 4. Gitea 사용자·팀 관리
+- 사용자 목록(팀·상태·마지막 로그인), 생성(임시 비밀번호 + 첫 로그인 때 변경 강제, 팀 지정), 로그인 차단/허용, 비밀번호 초기화, 팀 구성원 추가/제거
+- site admin 계정 `gitea-mgmt-svc` 토큰(`GITEA_MGMT_TOKEN`)으로 Gitea API 호출
+- 보호: site admin 과 보호 팀(`GITEA_PROTECTED_TEAMS`, 기본 `Owners,ci-*,svc-*`) 구성원은 어떤 변경도 거부, 보호 팀 구성원 추가/제거도 거부. 매 요청마다 Gitea 현재 상태로 판정
+- 사용자 삭제, 팀·저장소 생성/삭제, 팀 권한 변경은 하지 않음 (Gitea 화면에서 gitea_admin 으로)
+- 임시 비밀번호는 응답으로 한 번만 돌려주고 저장·로그·이력에 남기지 않음
+- 웹: monitoring-web `/admin` → **Gitea 사용자** 탭
+
+### 5. 관리 작업 이력 (감사 로그)
+- 로그인(성공/실패/잠김), 계정 발급·회수, YAML 적용·삭제, 관리자 추가, Gitea 관리(`gitea.*`)를 성공·실패 모두 `audit_log`에 기록
+- 누가(`actor`) · 어디서(`ip`) · 무엇을(`action`) · 어디에(`target`) · 결과(`result`) · 부가 정보(`detail`, 비밀값 제외)
+- 기록 실패는 본 작업을 막지 않는다 (경고 로그만)
+- `audit_log`가 생기기 전 기록은 첫 기동 때 한 번 이관된다 (`detail.migrated = true`)
+- 웹: monitoring-web `/admin` → **작업 이력** 탭
 
 ## 🏗 아키텍처
 
@@ -81,7 +98,9 @@ admin_manager/
 │   └── routers/
 │       ├── authRouter.cjs       # /api/auth
 │       ├── accountRouter.cjs    # /api/accounts
-│       └── manifestRouter.cjs   # /api/manifests
+│       ├── manifestRouter.cjs   # /api/manifests
+│       ├── auditRouter.cjs      # /api/audit
+│       └── giteaAdminRouter.cjs # /api/gitea
 ├── services/
 │   ├── authService.cjs          # 로그인, 관리자 생성, 부트스트랩
 │   ├── dbService.cjs            # pg Pool + 스키마 초기화
@@ -115,9 +134,17 @@ admin_manager/
 | GET | `/api/manifests?namespace=&kind=` | Kind별 리소스 목록 |
 | GET | `/api/manifests/one?namespace=&kind=&name=` | 리소스 단건 조회 (편집용으로 정제) |
 | GET | `/api/manifests/by-pod?namespace=&pod=` | Pod 연관 리소스 묶음 조회 |
-| PUT | `/api/manifests` | 매니페스트 생성/수정 (upsert) |
+| PUT | `/api/manifests` | 매니페스트 생성/수정 (upsert). 조회는 모든 네임스페이스, 수정·삭제는 `ISSUABLE_NAMESPACES` 에서만(그 밖은 403) |
 | DELETE | `/api/manifests?apiVersion=&kind=&namespace=&name=` | 리소스 삭제 |
 | GET | `/api/manifests/history?namespace=` | 변경 감사 이력 (최근 200건) |
+| GET | `/api/gitea/users` | Gitea 사용자 목록 (팀, 차단 여부, 보호 사유) |
+| GET | `/api/gitea/teams` | myorg 조직 팀 목록 + 구성원 + 보호 여부 |
+| POST | `/api/gitea/users` | 사용자 생성 (`username`, `email`, `fullName?`, `teams?`) → 임시 비밀번호 |
+| PATCH | `/api/gitea/users/:username/login` | 로그인 차단/허용 (`prohibitLogin`) |
+| POST | `/api/gitea/users/:username/reset-password` | 비밀번호 초기화 (`mustChange?`, 기본 true) → 임시 비밀번호 |
+| PUT | `/api/gitea/teams/:team/members/:username` | 팀 구성원 추가 |
+| DELETE | `/api/gitea/teams/:team/members/:username` | 팀 구성원 제거 |
+| GET | `/api/audit?action=&actor=&target=&result=&before=&limit=` | 관리 작업 이력. 최신순, `limit` 기본 50·최대 200, `before=<id>`로 다음 페이지, `action=account.*`처럼 접두어 검색 |
 
 <details>
 <summary>예시: 개발자 계정 발급</summary>
@@ -146,6 +173,7 @@ curl -X POST http://localhost:8100/api/accounts \
 | `admin_users` | 관리자 계정 (username, bcrypt 해시) |
 | `account_issuances` | 개발자 계정 발급/회수 이력 (`revoked_at IS NULL` = 활성) |
 | `manifest_history` | 매니페스트 create / update / delete 감사 로그 (적용된 매니페스트 JSONB 포함) |
+| `audit_log` | 모든 관리 작업 이력 (로그인·발급·회수·YAML·관리자 추가, 성공/실패) |
 
 스키마는 기동 시 `CREATE TABLE IF NOT EXISTS`로 자동 생성됩니다.
 
@@ -178,7 +206,11 @@ docker run --env-file .env -p 8100:8100 admin-manager
 | `PGHOST` / `PGPORT` / `PGDATABASE` / `PGUSER` / `PGPASSWORD` | PostgreSQL 접속 정보 | — |
 | `JWT_SECRET` | JWT 서명 키 (**필수**) | — |
 | `JWT_EXPIRES_IN` | JWT 만료 | `8h` |
-| `ADMIN_BOOTSTRAP_USERNAME` / `ADMIN_BOOTSTRAP_PASSWORD` | 최초 관리자 계정 | — |
+| `GITEA_BASE_URL` | Gitea 주소 (비우면 Gitea 관리 API 503) | — |
+| `GITEA_MGMT_TOKEN` | site admin 토큰 (write:admin, write:organization, write:user) | — |
+| `GITEA_ORG` | 팀을 관리할 조직 | `myorg` |
+| `GITEA_PROTECTED_TEAMS` | 보호 팀 (쉼표, 끝의 `*`는 접두어) | `Owners,ci-*,svc-*` |
+| `ADMIN_BOOTSTRAP_USERNAME` / `ADMIN_BOOTSTRAP_PASSWORD` | 최초 관리자 계정 (`admin_users`가 비어 있을 때만 사용. 계정이 만들어지면 Secret에서 지운다) | — |
 | `KUBECONFIG` | 로컬 개발용 kubeconfig 경로 | `~/.kube/config` |
 
 ## 🔐 설계 포인트 & 고민한 점

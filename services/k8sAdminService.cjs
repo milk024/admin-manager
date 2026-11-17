@@ -11,6 +11,7 @@ const dbService = require('./dbService.cjs');
 // TokenRequest로 발급하는 토큰의 기본 만료 기간. 옛날 방식(ServiceAccount Secret에 영구 토큰이
 // 자동으로 딸려오던 것)과 달리 TokenRequest 토큰은 반드시 만료된다 — 보안상 더 안전하지만,
 // 발급한 kubeconfig가 이 기간 이후엔 못 쓰게 된다는 뜻이다. 갱신 기능은 이번 스캐폴딩 범위 밖.
+const ARGOCD_TRACKING_ANNOTATION = 'argocd.argoproj.io/tracking-id';
 const TOKEN_EXPIRATION_SECONDS = 60 * 60 * 24 * 365; // 1년
 
 class K8sAdminService {
@@ -47,37 +48,62 @@ class K8sAdminService {
 
   async issueDeveloperAccount({ namespace, name, rbacTemplate, issuedBy }) {
     const rules = rbacTemplateHelper.getRules(rbacTemplate); // 존재하지 않는 템플릿이면 여기서 던짐
-
-    await this.coreApi.createNamespacedServiceAccount({
-      namespace,
-      body: { metadata: { name, labels: { 'admin-manager/issued': 'true' } } },
-    });
-
     const roleName = `${name}-role`;
-    await this.rbacApi.createNamespacedRole({
-      namespace,
-      body: { metadata: { name: roleName }, rules },
-    });
 
-    await this.rbacApi.createNamespacedRoleBinding({
-      namespace,
-      body: {
-        metadata: { name: `${name}-binding` },
-        subjects: [{ kind: 'ServiceAccount', name, namespace }],
-        roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'Role', name: roleName },
-      },
-    });
+    // 1) DB 에 먼저 기록해 이름을 선점한다. 회수되지 않은 같은 이름이 있으면 K8s 리소스를 만들기 전에 409 로 끝낸다.
+    let issuanceId;
+    try {
+      const { rows } = await dbService.query(
+        `INSERT INTO account_issuances (namespace, service_account, rbac_template, issued_by)
+         VALUES ($1, $2, $3, $4) RETURNING id`,
+        [namespace, name, rbacTemplate, issuedBy],
+      );
+      issuanceId = rows[0].id;
+    } catch (err) {
+      if (err.code === '23505') { // unique_violation
+        const conflict = new Error(`이미 발급된 계정입니다: ${namespace}/${name} (먼저 회수하세요)`);
+        conflict.code = 409;
+        throw conflict;
+      }
+      throw err;
+    }
 
-    const kubeconfig = await this._buildKubeconfig(namespace, name);
+    // 2) K8s 리소스 생성. 중간에 실패하면 만든 것만 되돌리고 DB 기록도 지운다 (고아 SA/Role 방지).
+    const created = [];
+    try {
+      await this.coreApi.createNamespacedServiceAccount({
+        namespace,
+        body: { metadata: { name, labels: { 'admin-manager/issued': 'true' } } },
+      });
+      created.push(() => this.coreApi.deleteNamespacedServiceAccount({ namespace, name }));
 
-    await dbService.query(
-      `INSERT INTO account_issuances (namespace, service_account, rbac_template, issued_by)
-       VALUES ($1, $2, $3, $4)`,
-      [namespace, name, rbacTemplate, issuedBy],
-    );
+      await this.rbacApi.createNamespacedRole({
+        namespace,
+        body: { metadata: { name: roleName, labels: { 'admin-manager/issued': 'true' } }, rules },
+      });
+      created.push(() => this.rbacApi.deleteNamespacedRole({ namespace, name: roleName }));
 
-    logHelper.info('K8sAdminService', `개발자 계정 발급: ${namespace}/${name} (템플릿: ${rbacTemplate}, 발급자: ${issuedBy})`);
-    return { namespace, name, rbacTemplate, kubeconfig };
+      await this.rbacApi.createNamespacedRoleBinding({
+        namespace,
+        body: {
+          metadata: { name: `${name}-binding`, labels: { 'admin-manager/issued': 'true' } },
+          subjects: [{ kind: 'ServiceAccount', name, namespace }],
+          roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'Role', name: roleName },
+        },
+      });
+      created.push(() => this.rbacApi.deleteNamespacedRoleBinding({ namespace, name: `${name}-binding` }));
+
+      const kubeconfig = await this._buildKubeconfig(namespace, name);
+      logHelper.info('K8sAdminService', `개발자 계정 발급: ${namespace}/${name} (템플릿: ${rbacTemplate}, 발급자: ${issuedBy})`);
+      return { namespace, name, rbacTemplate, kubeconfig };
+    } catch (err) {
+      for (const undo of created.reverse()) {
+        await undo().catch((e) => logHelper.warn('K8sAdminService', `발급 롤백 중 삭제 실패: ${e.message}`));
+      }
+      await dbService.query('DELETE FROM account_issuances WHERE id = $1', [issuanceId])
+        .catch((e) => logHelper.warn('K8sAdminService', `발급 롤백 중 DB 정리 실패: ${e.message}`));
+      throw err;
+    }
   }
 
   async _buildKubeconfig(namespace, serviceAccountName) {
@@ -93,12 +119,19 @@ class K8sAdminService {
       throw new Error('현재 KubeConfig에서 cluster 정보를 찾을 수 없습니다');
     }
 
+    // in-cluster 로 기동하면 CA 는 파일(caFile)로만 잡히고 caData 가 비어 있다 → 파일을 읽어 넣어 줘야
+    // 개발자 PC 의 kubectl 이 API 서버 인증서를 검증할 수 있다.
+    let caData = cluster.caData;
+    if (!caData && cluster.caFile) {
+      caData = fs.readFileSync(cluster.caFile).toString('base64');
+    }
+
     const kc = new k8s.KubeConfig();
     kc.loadFromOptions({
       clusters: [{
         name: cluster.name,
-        server: cluster.server,
-        caData: cluster.caData,
+        server: config.publicApiServer || cluster.server,
+        caData,
         skipTLSVerify: cluster.skipTLSVerify,
       }],
       users: [{ name: serviceAccountName, token }],
@@ -113,17 +146,17 @@ class K8sAdminService {
     return kc.exportConfig();
   }
 
-  async revokeDeveloperAccount({ namespace, name }) {
+  async revokeDeveloperAccount({ namespace, name, revokedBy }) {
     await this.rbacApi.deleteNamespacedRoleBinding({ namespace, name: `${name}-binding` });
     await this.rbacApi.deleteNamespacedRole({ namespace, name: `${name}-role` });
     await this.coreApi.deleteNamespacedServiceAccount({ namespace, name });
 
     await dbService.query(
-      `UPDATE account_issuances SET revoked_at = now()
+      `UPDATE account_issuances SET revoked_at = now(), revoked_by = $3
        WHERE namespace = $1 AND service_account = $2 AND revoked_at IS NULL`,
-      [namespace, name],
+      [namespace, name, revokedBy || null],
     );
-    logHelper.info('K8sAdminService', `개발자 계정 회수: ${namespace}/${name}`);
+    logHelper.info('K8sAdminService', `개발자 계정 회수: ${namespace}/${name} (회수자: ${revokedBy})`);
   }
 
   async listIssuedAccounts(namespace) {
@@ -140,18 +173,21 @@ class K8sAdminService {
 
   // ── 네임스페이스 전체 YAML 관리 (Kind 화이트리스트 적용) ──────────────────────
 
-  // 주의: objectApi.patch()는 기본이 StrategicMergePatch인데, 이건 core/apps 그룹
-  // 리소스(Deployment/Service/ConfigMap/PVC)엔 잘 맞지만 HTTPRoute처럼 CRD인 리소스는
-  // 보통 StrategicMergePatch를 지원하지 않고 MergePatch/JSON Patch만 지원한다.
-  // HTTPRoute를 실제로 수정해보고 안 되면 patch(manifest, ..., PatchStrategy.MergePatch)로
-  // 바꿔야 할 수 있음 — npm install 검증 시점엔 실제 HTTPRoute patch까진 테스트 안 함
-  // (라이브 Gateway 라우팅에 영향을 줄 수 있어 이번 검증 범위에서 제외).
+  // 수정 방식: 내장 리소스는 strategic merge patch, CRD(HTTPRoute)는 merge patch.
+  // objectApi.patch() 기본값(strategic)을 CRD 에 보내면 API 서버가 415 로 거절한다 (2026-11-17 확인).
   async applyManifest(manifest, appliedBy) {
     manifestWhitelistHelper.assertAllowed(manifest.kind);
+    manifestWhitelistHelper.assertApiVersion(manifest.kind, manifest.apiVersion);
     const namespace = manifest.metadata?.namespace;
     const name = manifest.metadata?.name;
     if (!namespace || !name) {
       throw new Error('manifest.metadata.namespace/name은 필수입니다');
+    }
+    this._assertWritableNamespace(namespace);
+
+    // ArgoCD 추적 표시를 직접 붙여 새 리소스를 만들면 ArgoCD 가 자기 것으로 오인하므로 입력에서 제거
+    if (manifest.metadata?.annotations) {
+      delete manifest.metadata.annotations[ARGOCD_TRACKING_ANNOTATION];
     }
 
     let action;
@@ -163,10 +199,14 @@ class K8sAdminService {
       });
       // 편집기에서 열람 후 저장까지 시간차가 있을 수 있으므로, 그 사이 다른 관리자가
       // 먼저 바꿨다면(예전에 GET한 resourceVersion과 지금 다르면) 조용히 덮어쓰지 않고 에러.
+      this._assertNotArgoManaged(current);
       if (manifest.metadata?.resourceVersion && manifest.metadata.resourceVersion !== current.metadata.resourceVersion) {
         throw new Error('이 리소스는 조회 이후 다른 곳에서 변경되었습니다 — 새로고침 후 다시 시도하세요');
       }
-      await this.objectApi.patch(manifest);
+      const strategy = manifestWhitelistHelper.patchStrategyFor(manifest.kind) === 'merge'
+        ? k8s.PatchStrategy.MergePatch
+        : k8s.PatchStrategy.StrategicMergePatch;
+      await this.objectApi.patch(manifest, undefined, undefined, 'admin-manager', undefined, strategy);
       action = 'update';
     } catch (err) {
       if (err.code !== 404) throw err;
@@ -184,6 +224,10 @@ class K8sAdminService {
 
   async deleteManifest({ apiVersion, kind, namespace, name }, appliedBy) {
     manifestWhitelistHelper.assertAllowed(kind);
+    manifestWhitelistHelper.assertApiVersion(kind, apiVersion);
+    this._assertWritableNamespace(namespace);
+    const current = await this.objectApi.read({ apiVersion, kind, metadata: { namespace, name } });
+    this._assertNotArgoManaged(current);
     await this.objectApi.delete({ apiVersion, kind, metadata: { namespace, name } });
 
     await dbService.query(
@@ -202,6 +246,34 @@ class K8sAdminService {
     const apiVersion = manifestWhitelistHelper.apiVersionFor(kind);
     const manifest = await this.objectApi.read({ apiVersion, kind, metadata: { namespace, name } });
     return this._sanitizeForEditing(manifest);
+  }
+
+  // ArgoCD 가 배포 저장소(deploy-*)로 관리하는 리소스는 여기서 바꿔도 몇 초 안에 되돌려지므로(selfHeal)
+  // 수정·삭제를 막고 배포 저장소에서 바꾸도록 안내한다. 조회는 그대로 허용.
+  isArgoManaged(obj) {
+    return Boolean(obj?.metadata?.annotations?.[ARGOCD_TRACKING_ANNOTATION]);
+  }
+
+  // 조회는 모든 네임스페이스(ClusterRole admin-manager-read), 수정·삭제는 ISSUABLE_NAMESPACES 에만
+  // (배포 차트 rbac.namespaces 와 같은 목록). K8s 도 403 으로 막지만 이유를 알기 쉽게 먼저 거부한다.
+  // 목록이 비어 있으면 제한 없음(로컬 개발).
+  isWritableNamespace(namespace) {
+    return config.issuableNamespaces.length === 0 || config.issuableNamespaces.includes(namespace);
+  }
+
+  _assertWritableNamespace(namespace) {
+    if (this.isWritableNamespace(namespace)) return;
+    const err = new Error(`${namespace} 는 읽기 전용입니다. 수정·삭제는 ${config.issuableNamespaces.join(', ')} 에서만 할 수 있습니다`);
+    err.code = 403;
+    throw err;
+  }
+
+  _assertNotArgoManaged(obj) {
+    if (!this.isArgoManaged(obj)) return;
+    const app = obj.metadata.annotations[ARGOCD_TRACKING_ANNOTATION].split(':')[0];
+    const err = new Error(`ArgoCD(Application ${app})가 관리하는 리소스라 여기서 수정·삭제할 수 없습니다. 배포 저장소(deploy-*)에서 변경하세요`);
+    err.code = 409;
+    throw err;
   }
 
   _sanitizeForEditing(manifest) {

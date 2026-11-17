@@ -6,6 +6,10 @@ const jwtHelper = require('../helpers/jwtHelper.cjs');
 const config = require('../helpers/configHelper.cjs');
 const logHelper = require('../helpers/logHelper.cjs');
 
+// 없는 계정으로 로그인할 때도 같은 bcrypt 비교를 하기 위한 더미 해시 (처음 쓸 때 한 번 생성)
+let dummyHashPromise = null;
+const dummyHash = () => (dummyHashPromise ||= passwordHelper.hash('timing-equalizer-not-a-real-password'));
+
 class AuthService {
   // admin_users가 완전히 비어있을 때만 .env의 ADMIN_BOOTSTRAP_* 값으로 최초 계정을 만든다.
   // 이후 기동부터는 테이블에 이미 계정이 있으니 항상 스킵됨 — .env에 값이 남아있어도 안전.
@@ -29,10 +33,11 @@ class AuthService {
   async login(username, password) {
     const { rows } = await dbService.query('SELECT * FROM admin_users WHERE username = $1', [username]);
     const user = rows[0];
+    // 계정이 없어도 bcrypt 비교 시간만큼 걸리게 해서 응답 시간으로 계정 존재 여부가 드러나지 않게 한다
+    const valid = await passwordHelper.verify(password, user ? user.password_hash : await dummyHash());
     if (!user) {
       throw new Error('존재하지 않는 계정입니다');
     }
-    const valid = await passwordHelper.verify(password, user.password_hash);
     if (!valid) {
       throw new Error('비밀번호가 올바르지 않습니다');
     }
